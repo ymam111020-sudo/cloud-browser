@@ -12,7 +12,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', async (ws) => {
-  console.log('Client connected. Starting lightweight Chromium...');
+  console.log('Client connected');
 
   let browser;
   try {
@@ -28,39 +28,35 @@ wss.on('connection', async (ws) => {
         '--no-zygote',
         '--disable-extensions',
         '--disable-background-networking',
-        '--disable-default-apps',
-        '--disable-sync',
-        '--disable-translate',
         '--hide-scrollbars',
-        '--metrics-recording-only',
         '--mute-audio',
-        '--no-default-browser-check',
         '--window-size=1024,768'
       ]
     });
 
-    console.log('Chromium started within memory limits!');
     const page = await browser.newPage();
     await page.setViewport({ width: 1024, height: 768 });
-
-    // 不要な画像読み込みなどを制限せず、Googleトップを開く
-    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    console.log('Google loaded successfully');
+    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded' });
 
     const cdp = await page.target().createCDPSession();
+    // 画質を75に引き上げ、スムーズな描画設定に変更
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
-      quality: 40, // 帯域とメモリ負荷を軽減
+      quality: 75,
       everyNthFrame: 1
     });
 
+    let isSending = false;
     cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
-      try {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'frame', data }));
-          await cdp.send('Page.screencastFrameAck', { sessionId });
-        }
-      } catch (e) {}
+      // ネットワーク詰まりを防ぐため、送信完了を待たずに即座に応答
+      cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+      
+      if (ws.readyState === WebSocket.OPEN && !isSending) {
+        isSending = true;
+        ws.send(JSON.stringify({ type: 'frame', data }), () => {
+          isSending = false;
+        });
+      }
     });
 
     ws.on('message', async (message) => {
@@ -69,13 +65,14 @@ wss.on('connection', async (ws) => {
         if (action.type === 'click') {
           await page.mouse.click(action.x, action.y);
         } else if (action.type === 'type') {
+          // 日本語を含む文字列入力に対応
           await page.keyboard.type(action.text);
         } else if (action.type === 'key') {
           await page.keyboard.press(action.key);
         } else if (action.type === 'scroll') {
           await page.mouse.wheel({ deltaY: action.deltaY });
         } else if (action.type === 'navigate') {
-          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+          await page.goto(action.url, { waitUntil: 'domcontentloaded' });
         }
       } catch (err) {
         console.error('Action error:', err);
@@ -89,9 +86,6 @@ wss.on('connection', async (ws) => {
 
   } catch (err) {
     console.error('Launch failed:', err);
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'error', message: err.message }));
-    }
     if (browser) await browser.close();
   }
 });
