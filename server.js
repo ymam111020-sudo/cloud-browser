@@ -12,13 +12,14 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', async (ws) => {
-  console.log('Client connected');
+  console.log('Client connected. Starting Chromium...');
 
   let browser;
   try {
     browser = await puppeteer.launch({
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
+      timeout: 60000, // 起動待ち時間を延長
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -26,20 +27,27 @@ wss.on('connection', async (ws) => {
         '--disable-gpu',
         '--no-first-run',
         '--no-zygote',
+        '--single-process', // コンテナ内でのプロセスフリーズを回避
         '--disable-extensions',
         '--disable-background-networking',
-        '--hide-scrollbars',
+        '--disable-breakpad', // クラッシュレポーターをオフにして待機を防止
+        '--disable-component-update',
+        '--disable-domain-reliability',
+        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
+        '--disable-ipc-flooding-protection',
+        '--disable-renderer-backgrounding',
         '--mute-audio',
         '--window-size=1024,768'
       ]
     });
 
+    console.log('Chromium started successfully!');
     const page = await browser.newPage();
     await page.setViewport({ width: 1024, height: 768 });
-    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded' });
+    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    console.log('Google page loaded');
 
     const cdp = await page.target().createCDPSession();
-    // 画質を75に引き上げ、スムーズな描画設定に変更
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
       quality: 75,
@@ -48,9 +56,7 @@ wss.on('connection', async (ws) => {
 
     let isSending = false;
     cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
-      // ネットワーク詰まりを防ぐため、送信完了を待たずに即座に応答
       cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
-      
       if (ws.readyState === WebSocket.OPEN && !isSending) {
         isSending = true;
         ws.send(JSON.stringify({ type: 'frame', data }), () => {
@@ -65,14 +71,13 @@ wss.on('connection', async (ws) => {
         if (action.type === 'click') {
           await page.mouse.click(action.x, action.y);
         } else if (action.type === 'type') {
-          // 日本語を含む文字列入力に対応
           await page.keyboard.type(action.text);
         } else if (action.type === 'key') {
           await page.keyboard.press(action.key);
         } else if (action.type === 'scroll') {
           await page.mouse.wheel({ deltaY: action.deltaY });
         } else if (action.type === 'navigate') {
-          await page.goto(action.url, { waitUntil: 'domcontentloaded' });
+          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
       } catch (err) {
         console.error('Action error:', err);
