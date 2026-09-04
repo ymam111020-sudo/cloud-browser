@@ -1,21 +1,23 @@
 FROM node:20-slim
 
-RUN apt-get update \
-    && apt-get install -y wget gnupg \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
-    && sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable fonts-ipafont-gothic fonts-freefont-ttf libxss1 \
-      --no-install-recommends \
+# Chromium本体と日本語フォント、最小限の依存ライブラリのみをインストール
+RUN apt-get update && apt-get install -y \
+    chromium \
+    fonts-ipafont-gothic \
+    fonts-freefont-ttf \
+    --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
+# 軽量なChromiumのパスを指定
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
+
 COPY package*.json ./
-RUN npm install
+RUN npm install --omit=dev
+
 COPY . .
 
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
