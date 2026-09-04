@@ -1,99 +1,58 @@
 const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-const puppeteer = require('puppeteer');
+const httpProxy = require('http-proxy');
 
 const app = express();
+const proxy = httpProxy.createProxyServer({
+  changeOrigin: true,
+  autoRewrite: true,
+  followRedirects: true
+});
 
-app.get('/ping', (req, res) => res.status(200).send('pong'));
-app.get('/', (req, res) => res.status(200).send('Remote Browser Server is Running!'));
+// レスポンスヘッダーから iframe 制限を削除
+proxy.on('proxyRes', (proxyRes) => {
+  delete proxyRes.headers['x-frame-options'];
+  delete proxyRes.headers['content-security-policy'];
+  delete proxyRes.headers['content-security-policy-report-only'];
 
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+  // どのオリジンからでもiframe埋め込みを許可
+  proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+  proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
+});
 
-wss.on('connection', async (ws) => {
-  console.log('Client connected. Starting Chromium...');
-
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-      timeout: 60000, // 起動待ち時間を延長
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process', // コンテナ内でのプロセスフリーズを回避
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-breakpad', // クラッシュレポーターをオフにして待機を防止
-        '--disable-component-update',
-        '--disable-domain-reliability',
-        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
-        '--disable-ipc-flooding-protection',
-        '--disable-renderer-backgrounding',
-        '--mute-audio',
-        '--window-size=1024,768'
-      ]
-    });
-
-    console.log('Chromium started successfully!');
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1024, height: 768 });
-    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    console.log('Google page loaded');
-
-    const cdp = await page.target().createCDPSession();
-    await cdp.send('Page.startScreencast', {
-      format: 'jpeg',
-      quality: 75,
-      everyNthFrame: 1
-    });
-
-    let isSending = false;
-    cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
-      cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
-      if (ws.readyState === WebSocket.OPEN && !isSending) {
-        isSending = true;
-        ws.send(JSON.stringify({ type: 'frame', data }), () => {
-          isSending = false;
-        });
-      }
-    });
-
-    ws.on('message', async (message) => {
-      try {
-        const action = JSON.parse(message);
-        if (action.type === 'click') {
-          await page.mouse.click(action.x, action.y);
-        } else if (action.type === 'type') {
-          await page.keyboard.type(action.text);
-        } else if (action.type === 'key') {
-          await page.keyboard.press(action.key);
-        } else if (action.type === 'scroll') {
-          await page.mouse.wheel({ deltaY: action.deltaY });
-        } else if (action.type === 'navigate') {
-          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        }
-      } catch (err) {
-        console.error('Action error:', err);
-      }
-    });
-
-    ws.on('close', async () => {
-      console.log('Client disconnected');
-      if (browser) await browser.close();
-    });
-
-  } catch (err) {
-    console.error('Launch failed:', err);
-    if (browser) await browser.close();
+// エラーハンドリング
+proxy.on('error', (err, req, res) => {
+  console.error('Proxy Error:', err.message);
+  if (!res.headersSent) {
+    res.status(500).send('Proxy Error: ' + err.message);
   }
 });
 
+// 常時稼働監視用
+app.get('/ping', (req, res) => res.status(200).send('pong'));
+
+// プロキシ中継ルート: /proxy?url=https://example.com
+app.all('/proxy', (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) {
+    return res.status(400).send('Missing "url" parameter');
+  }
+
+  try {
+    const parsed = new URL(targetUrl);
+    proxy.web(req, res, {
+      target: parsed.origin,
+      headers: {
+        host: parsed.host
+      }
+    });
+  } catch (e) {
+    res.status(400).send('Invalid URL format');
+  }
+});
+
+app.get('/', (req, res) => {
+  res.send('Proxy Server is Running!');
+});
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy server running on port ${PORT}`));
