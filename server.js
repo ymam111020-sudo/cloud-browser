@@ -2,7 +2,6 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const puppeteer = require('puppeteer');
-const fs = require('fs');
 
 const app = express();
 
@@ -12,49 +11,46 @@ app.get('/', (req, res) => res.status(200).send('Remote Browser Server is Runnin
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Chromeの実行可能パス判定
-let chromePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/google-chrome-stable';
-if (!fs.existsSync(chromePath)) {
-  if (fs.existsSync('/usr/bin/google-chrome')) chromePath = '/usr/bin/google-chrome';
-  else if (fs.existsSync('/usr/bin/chromium')) chromePath = '/usr/bin/chromium';
-  else if (fs.existsSync('/usr/bin/chromium-browser')) chromePath = '/usr/bin/chromium-browser';
-}
-
 wss.on('connection', async (ws) => {
-  console.log('Client connected. Starting browser...');
+  console.log('Client connected. Starting lightweight Chromium...');
 
   let browser;
   try {
     browser = await puppeteer.launch({
-      headless: true, // 安定動作のためにシンプルな headless モードを指定
-      executablePath: chromePath,
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--disable-software-rasterizer',
         '--no-first-run',
         '--no-zygote',
         '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
         '--hide-scrollbars',
+        '--metrics-recording-only',
         '--mute-audio',
-        '--window-size=1280,720'
+        '--no-default-browser-check',
+        '--window-size=1024,768'
       ]
     });
 
-    console.log('Browser launched successfully');
+    console.log('Chromium started within memory limits!');
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 720 });
-    
-    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    console.log('Page loaded');
+    await page.setViewport({ width: 1024, height: 768 });
 
-    // CDPセッション開始
+    // 不要な画像読み込みなどを制限せず、Googleトップを開く
+    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 25000 });
+    console.log('Google loaded successfully');
+
     const cdp = await page.target().createCDPSession();
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
-      quality: 50,
+      quality: 40, // 帯域とメモリ負荷を軽減
       everyNthFrame: 1
     });
 
@@ -67,7 +63,6 @@ wss.on('connection', async (ws) => {
       } catch (e) {}
     });
 
-    // 操作イベント
     ws.on('message', async (message) => {
       try {
         const action = JSON.parse(message);
@@ -80,7 +75,7 @@ wss.on('connection', async (ws) => {
         } else if (action.type === 'scroll') {
           await page.mouse.wheel({ deltaY: action.deltaY });
         } else if (action.type === 'navigate') {
-          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 25000 });
         }
       } catch (err) {
         console.error('Action error:', err);
@@ -93,7 +88,7 @@ wss.on('connection', async (ws) => {
     });
 
   } catch (err) {
-    console.error('Puppeteer launch error:', err);
+    console.error('Launch failed:', err);
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'error', message: err.message }));
     }
@@ -102,4 +97,4 @@ wss.on('connection', async (ws) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
