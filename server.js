@@ -1,59 +1,41 @@
-const express = require('express');
-const httpProxy = require('http-proxy');
+import { createBareServer } from 'bare-server-node';
+import express from 'express';
+import { createServer } from 'node:http';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { uvPath } from '@titaniumnetwork-dev/ultraviolet';
 
+const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const app = express();
-const proxy = httpProxy.createProxyServer({
-  changeOrigin: true,
-  autoRewrite: true,
-  followRedirects: true
-});
-
-// レスポンスヘッダーの書き換え（iframe制限とCORSの解除）
-proxy.on('proxyRes', (proxyRes) => {
-  delete proxyRes.headers['x-frame-options'];
-  delete proxyRes.headers['content-security-policy'];
-  delete proxyRes.headers['content-security-policy-report-only'];
-
-  proxyRes.headers['access-control-allow-origin'] = '*';
-  proxyRes.headers['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
-});
-
-// エラーハンドリング
-proxy.on('error', (err, req, res) => {
-  console.error('Proxy Error:', err.message);
-  if (!res.headersSent) {
-    res.status(500).send('Proxy Error: ' + err.message);
-  }
-});
+const bareServer = createBareServer('/bare/');
+const server = createServer();
 
 // 常時稼働用の死活監視
 app.get('/ping', (req, res) => res.status(200).send('pong'));
-app.get('/', (req, res) => res.send('Proxy Server is Running!'));
 
-// プロキシ中継
-app.use('/proxy', (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) {
-    return res.status(400).send('Missing "url" parameter');
+// Ultraviolet のクライアント側スクリプト群を静的配信
+app.use('/uv/', express.static(uvPath));
+
+// フロントエンド画面（検索バー・iframe UI）
+app.use(express.static(join(__dirname, 'public')));
+
+server.on('request', (req, res) => {
+  if (bareServer.shouldRoute(req)) {
+    bareServer.routeRequest(req, res);
+  } else {
+    app(req, res);
   }
+});
 
-  try {
-    const parsed = new URL(targetUrl);
-
-    // リクエストのURLパスを本来のパス（pathname + search）に書き換えて転送
-    req.url = parsed.pathname + parsed.search;
-
-    proxy.web(req, res, {
-      target: parsed.origin,
-      headers: {
-        host: parsed.host,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
-    });
-  } catch (e) {
-    res.status(400).send('Invalid URL format');
+server.on('upgrade', (req, socket, head) => {
+  if (bareServer.shouldRoute(req)) {
+    bareServer.routeUpgrade(req, socket, head);
+  } else {
+    socket.end();
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Ultraviolet server running on port ${PORT}`);
+});
