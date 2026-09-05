@@ -1,41 +1,64 @@
-import { createBareServer } from 'bare-server-node';
-import express from 'express';
-import { createServer } from 'node:http';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { uvPath } from '@titaniumnetwork-dev/ultraviolet';
+const express = require('express');
+const httpProxy = require('http-proxy');
+const cors = require('cors');
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const app = express();
-const bareServer = createBareServer('/bare/');
-const server = createServer();
+app.use(cors());
 
-// 常時稼働用の死活監視
-app.get('/ping', (req, res) => res.status(200).send('pong'));
+const proxy = httpProxy.createProxyServer({
+  changeOrigin: true,
+  autoRewrite: true,
+  followRedirects: true,
+  secure: false
+});
 
-// Ultraviolet のクライアント側スクリプト群を静的配信
-app.use('/uv/', express.static(uvPath));
+// iframeブロックとセキュリティ制限の解除
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  delete proxyRes.headers['x-frame-options'];
+  delete proxyRes.headers['content-security-policy'];
+  delete proxyRes.headers['content-security-policy-report-only'];
 
-// フロントエンド画面（検索バー・iframe UI）
-app.use(express.static(join(__dirname, 'public')));
+  proxyRes.headers['Access-Control-Allow-Origin'] = '*';
+  proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
+  proxyRes.headers['Access-Control-Allow-Headers'] = '*';
+});
 
-server.on('request', (req, res) => {
-  if (bareServer.shouldRoute(req)) {
-    bareServer.routeRequest(req, res);
-  } else {
-    app(req, res);
+proxy.on('error', (err, req, res) => {
+  console.error('Proxy Error:', err.message);
+  if (!res.headersSent) {
+    res.status(500).send('Proxy Connection Error: ' + err.message);
   }
 });
 
-server.on('upgrade', (req, socket, head) => {
-  if (bareServer.shouldRoute(req)) {
-    bareServer.routeUpgrade(req, socket, head);
-  } else {
-    socket.end();
+// 常時稼働用の死活監視
+app.get('/ping', (req, res) => res.status(200).send('pong'));
+app.get('/', (req, res) => res.send('Cloud Proxy Browser Server is Ready!'));
+
+// プロキシ中継ルート: /proxy?url=https://...
+app.use('/proxy', (req, res) => {
+  const targetUrl = req.query.url;
+  if (!targetUrl) {
+    return res.status(400).send('Missing "url" query parameter');
+  }
+
+  try {
+    const parsed = new URL(targetUrl);
+
+    // パスとクエリパラメータを保持して中継
+    req.url = parsed.pathname + parsed.search;
+
+    proxy.web(req, res, {
+      target: parsed.origin,
+      headers: {
+        host: parsed.host,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8'
+      }
+    });
+  } catch (e) {
+    res.status(400).send('Invalid URL format. Please include https://');
   }
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Ultraviolet server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
