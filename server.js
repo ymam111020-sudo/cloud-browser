@@ -38,7 +38,7 @@ app.all('/proxy', async (req, res) => {
       const html = response.data.toString('utf-8');
       const $ = cheerio.load(html);
 
-      // 相対パスの画像やCSSが壊れないように <base> を先頭に注入
+      // 相対パスの画像やCSSが壊れないように <base> を注入
       $('head').prepend(`<base href="${urlObj.origin}/">`);
 
       // リンクの書き換え (クリックしてもプロキシを維持)
@@ -66,7 +66,7 @@ app.all('/proxy', async (req, res) => {
       return res.send($.html());
     }
 
-    // 画像やJS、CSSなどはそのまま流す
+    // 画像やJS、CSSなどはそのまま返す
     res.set('content-type', contentType);
     res.send(response.data);
 
