@@ -8,13 +8,12 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.get('/ping', (req, res) => res.status(200).send('pong'));
-app.get('/', (req, res) => res.status(200).send('Relay Live'));
+app.get('/', (req, res) => res.status(200).send('Bandwidth Optimized Relay Live'));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const BROWSERLESS_KEY = '2VCcBcwhj8eBb5P8215938cdf24e971e5bc92351e1b9d7739';
-// セッションIDを固定して、クラウド側にプロファイル（ログイン状態）を永続化
 const SESSION_ID = 'user-auth-session-v1';
 const BROWSERLESS_ENDPOINT = `wss://chrome.browserless.io?token=${BROWSERLESS_KEY}&session=${SESSION_ID}&stealth=true&--disable-blink-features=AutomationControlled`;
 
@@ -31,40 +30,46 @@ async function getBrowser() {
 }
 
 wss.on('connection', async (ws) => {
-  console.log('Client connected to session');
+  console.log('Device connected. Initializing bandwidth-optimized session...');
 
   let page = null;
   let cdp = null;
 
   try {
     const browser = await getBrowser();
-    const pages = await browser.pages();
-    page = pages.length > 0 ? pages[0] : await browser.newPage();
+    page = await browser.newPage();
 
-    await page.setViewport({ width: 1024, height: 768 });
+    // 転送バイト数を減らすためビューポートを最適化 (960x640)
+    await page.setViewport({ width: 960, height: 640 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8'
     });
     await page.emulateTimezone('Asia/Tokyo');
 
-    const currentUrl = page.url();
-    if (!currentUrl || currentUrl === 'about:blank') {
-      await page.goto('https://www.youtube.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    }
+    await page.goto('https://www.youtube.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     cdp = await page.target().createCDPSession();
+    
+    // everyNthFrame: 3 で生成フレーム自体を 1/3 に間引く
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
-      quality: 70,
-      everyNthFrame: 1
+      quality: 50,
+      everyNthFrame: 3
     });
 
     let isSending = false;
+    let lastSentTime = 0;
+    const MIN_INTERVAL_MS = 100; // 最短でも 100ms（最大 10 FPS）に制限
+
     cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
       cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
-      if (ws.readyState === WebSocket.OPEN && !isSending) {
+      
+      const now = Date.now();
+      // インターバル制限と送信中ロックの二重チェック
+      if (ws.readyState === WebSocket.OPEN && !isSending && (now - lastSentTime >= MIN_INTERVAL_MS)) {
         isSending = true;
+        lastSentTime = now;
         ws.send(JSON.stringify({ type: 'frame', data }), () => {
           isSending = false;
         });
@@ -74,7 +79,7 @@ wss.on('connection', async (ws) => {
     ws.on('message', async (message) => {
       try {
         const action = JSON.parse(message);
-        if (!page) return;
+        if (!page || page.isClosed()) return;
 
         if (action.type === 'click') {
           await page.mouse.click(action.x, action.y);
@@ -92,15 +97,22 @@ wss.on('connection', async (ws) => {
       }
     });
 
-    ws.on('close', () => {
-      console.log('Client disconnected (Session preserved on cloud)');
-      if (cdp) {
-        try { cdp.detach(); } catch (e) {}
-      }
+    ws.on('close', async () => {
+      console.log('Device disconnected. Cleaning up tab...');
+      try {
+        if (cdp) await cdp.detach();
+        if (page && !page.isClosed()) await page.close();
+      } catch (e) {}
+    });
+
+    ws.on('error', async () => {
+      try {
+        if (page && !page.isClosed()) await page.close();
+      } catch (e) {}
     });
 
   } catch (err) {
-    console.error('Session Error:', err.message);
+    console.error('Session error:', err.message);
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'error', message: err.message }));
     }
@@ -108,4 +120,4 @@ wss.on('connection', async (ws) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server live on port ${PORT}`));
+server.listen(PORT, () => console.log(`Optimized server live on port ${PORT}`));
