@@ -1,19 +1,20 @@
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const puppeteer = require('puppeteer-core');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+// ステルスプラグインを有効化（Bot検知フラグをすべて隠蔽）
+puppeteer.use(StealthPlugin());
 
 const app = express();
-
-// 死活監視用エンドポイント
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 app.get('/', (req, res) => res.status(200).send('Browser Relay Server Live'));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Browserlessの接続先エンドポイント
-const BROWSERLESS_ENDPOINT = 'wss://chrome.browserless.io?token=2VCcBcwhj8eBb5P8215938cdf24e971e5bc92351e1b9d7739';
+const BROWSERLESS_ENDPOINT = 'wss://chrome.browserless.io?token=2VCcBcwhj8eBb5P8215938cdf24e971e5bc92351e1b9d7739&stealth';
 
 wss.on('connection', async (ws) => {
   console.log('Client connected. Connecting to Cloud Chrome...');
@@ -23,7 +24,7 @@ wss.on('connection', async (ws) => {
   let cdp = null;
 
   try {
-    // 外部クラウドChromeへ接続
+    // Browserlessにステルスパラメータ付きで接続
     browser = await puppeteer.connect({
       browserWSEndpoint: BROWSERLESS_ENDPOINT
     });
@@ -32,6 +33,19 @@ wss.on('connection', async (ws) => {
 
     page = await browser.newPage();
     await page.setViewport({ width: 1024, height: 768 });
+
+    // 本物の一般ユーザーのChromeに見せかける設定
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8'
+    });
+
+    // webdriverフラグの強制削除
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      window.chrome = { runtime: {} };
+    });
+
     await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     cdp = await page.target().createCDPSession();
@@ -74,7 +88,6 @@ wss.on('connection', async (ws) => {
     });
 
     const cleanup = async () => {
-      console.log('Cleaning up session...');
       try {
         if (page) await page.close();
         if (browser) await browser.close();
@@ -85,10 +98,7 @@ wss.on('connection', async (ws) => {
     ws.on('error', cleanup);
 
   } catch (err) {
-    console.error('Cloud Chrome connection failed:', err.message);
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'error', message: err.message }));
-    }
+    console.error('Connection failed:', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
