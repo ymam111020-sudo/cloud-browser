@@ -1,10 +1,7 @@
 const express = require('express');
 const httpProxy = require('http-proxy');
-const cors = require('cors');
 
 const app = express();
-app.use(cors());
-
 const proxy = httpProxy.createProxyServer({
   changeOrigin: true,
   autoRewrite: true,
@@ -12,53 +9,60 @@ const proxy = httpProxy.createProxyServer({
   secure: false
 });
 
-// iframeブロックとセキュリティ制限の解除
-proxy.on('proxyRes', (proxyRes, req, res) => {
+// iframeブロックとCORS制限の解除
+proxy.on('proxyRes', function (proxyRes, req, res) {
   delete proxyRes.headers['x-frame-options'];
   delete proxyRes.headers['content-security-policy'];
   delete proxyRes.headers['content-security-policy-report-only'];
 
   proxyRes.headers['Access-Control-Allow-Origin'] = '*';
   proxyRes.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS';
-  proxyRes.headers['Access-Control-Allow-Headers'] = '*';
 });
 
-proxy.on('error', (err, req, res) => {
+// プロキシ接続エラー時のハンドリング
+proxy.on('error', function (err, req, res) {
   console.error('Proxy Error:', err.message);
   if (!res.headersSent) {
-    res.status(500).send('Proxy Connection Error: ' + err.message);
+    res.status(500).send('Proxy Error: ' + err.message);
   }
 });
 
 // 常時稼働用の死活監視
-app.get('/ping', (req, res) => res.status(200).send('pong'));
-app.get('/', (req, res) => res.send('Cloud Proxy Browser Server is Ready!'));
+app.get('/ping', function (req, res) {
+  res.status(200).send('pong');
+});
 
-// プロキシ中継ルート: /proxy?url=https://...
-app.use('/proxy', (req, res) => {
+app.get('/', function (req, res) {
+  res.send('Remote Browser Proxy Server is Running!');
+});
+
+// プロキシ中継ルート
+app.use('/proxy', function (req, res) {
   const targetUrl = req.query.url;
   if (!targetUrl) {
-    return res.status(400).send('Missing "url" query parameter');
+    return res.status(400).send('Missing "url" parameter');
   }
 
+  let parsed;
   try {
-    const parsed = new URL(targetUrl);
-
-    // パスとクエリパラメータを保持して中継
-    req.url = parsed.pathname + parsed.search;
-
-    proxy.web(req, res, {
-      target: parsed.origin,
-      headers: {
-        host: parsed.host,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8'
-      }
-    });
+    parsed = new URL(targetUrl);
   } catch (e) {
-    res.status(400).send('Invalid URL format. Please include https://');
+    return res.status(400).send('Invalid URL format');
   }
+
+  // ターゲット先のパスを保持
+  req.url = parsed.pathname + parsed.search;
+
+  proxy.web(req, res, {
+    target: parsed.origin,
+    headers: {
+      host: parsed.host,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+  });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, function () {
+  console.log('Server running on port ' + PORT);
+});
