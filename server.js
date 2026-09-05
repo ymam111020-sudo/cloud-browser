@@ -1,126 +1,79 @@
 const express = require('express');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const http = require('http');
+const WebSocket = require('ws');
+const puppeteer = require('puppeteer-core');
 
 const app = express();
-
 app.get('/ping', (req, res) => res.send('pong'));
-app.get('/', (req, res) => res.send('Proxy is live'));
+app.get('/', (req, res) => res.send('Browser Relay Server Live'));
 
-app.all('/proxy', async (req, res) => {
-  let targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).send('URL missing');
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
+const BROWSERLESS_KEY = process.env.BROWSERLESS_KEY || '2VCcBcwhj8eBb5P8215938cdf24e971e5bc92351e1b9d7739';
+
+wss.on('connection', async (ws) => {
+  console.log('Client connected. Connecting to Cloud Chrome...');
+
+  let browser;
   try {
-    const urlObj = new URL(targetUrl);
-
-    // フォーム送信時などの付加クエリ（例: q=検索ワード）をターゲットURLへ自動マージ
-    for (const [key, value] of Object.entries(req.query)) {
-      if (key !== 'url') {
-        urlObj.searchParams.set(key, value);
-      }
-    }
-    const finalUrl = urlObj.href;
-
-    // 目的のサーバーへリクエスト送信
-    const response = await axios({
-      method: req.method,
-      url: finalUrl,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8',
-        'Referer': urlObj.origin
-      },
-      responseType: 'arraybuffer',
-      validateStatus: () => true
+    // 高性能クラウドChromeへ接続
+    browser = await puppeteer.connect({
+      browserWSEndpoint: `wss://chrome.browserless.io?token=${BROWSERLESS_KEY}`
     });
 
-    // セキュリティ制約・iframeブロックを解除
-    res.removeHeader('x-frame-options');
-    res.removeHeader('content-security-policy');
-    res.removeHeader('content-security-policy-report-only');
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.set('Access-Control-Allow-Headers', '*');
+    console.log('Cloud Chrome connected successfully!');
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1024, height: 768 });
+    await page.goto('https://www.google.com', { waitUntil: 'domcontentloaded' });
 
-    const contentType = response.headers['content-type'] || '';
+    const cdp = await page.target().createCDPSession();
+    await cdp.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: 70,
+      everyNthFrame: 1
+    });
 
-    // HTMLの場合: リンク・フォーム・JavaScript内部通信の書き換え
-    if (contentType.includes('text/html')) {
-      const html = response.data.toString('utf-8');
-      const $ = cheerio.load(html);
+    let isSending = false;
+    cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
+      cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+      if (ws.readyState === WebSocket.OPEN && !isSending) {
+        isSending = true;
+        ws.send(JSON.stringify({ type: 'frame', data }), () => {
+          isSending = false;
+        });
+      }
+    });
 
-      // 相対パス解決用のベースタグ
-      $('head').prepend(`<base href="${urlObj.origin}/">`);
-
-      // YouTubeやGoogleの非同期通信(Fetch / XHR)をプロキシ経由にフックするスクリプトを注入
-      const proxyHookScript = `
-        <script>
-          (function() {
-            const originBase = "${urlObj.origin}";
-            function toProxyUrl(url) {
-              try {
-                const absolute = new URL(url, originBase).href;
-                return '/proxy?url=' + encodeURIComponent(absolute);
-              } catch(e) {
-                return url;
-              }
-            }
-
-            // fetch をフック
-            const originalFetch = window.fetch;
-            window.fetch = function(input, init) {
-              if (typeof input === 'string') {
-                input = toProxyUrl(input);
-              } else if (input instanceof Request) {
-                input = new Request(toProxyUrl(input.url), input);
-              }
-              return originalFetch.call(this, input, init);
-            };
-
-            // XMLHttpRequest をフック
-            const originalOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-              return originalOpen.call(this, method, toProxyUrl(url), ...rest);
-            };
-          })();
-        </script>
-      `;
-      $('head').prepend(proxyHookScript);
-
-      // 通常リンクの書き換え
-      $('a').each((_, el) => {
-        const href = $(el).attr('href');
-        if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
-          try {
-            const absoluteUrl = new URL(href, urlObj.origin).href;
-            $(el).attr('href', `/proxy?url=${encodeURIComponent(absoluteUrl)}`);
-          } catch (e) {}
+    ws.on('message', async (message) => {
+      try {
+        const action = JSON.parse(message);
+        if (action.type === 'click') {
+          await page.mouse.click(action.x, action.y);
+        } else if (action.type === 'type') {
+          await page.keyboard.type(action.text);
+        } else if (action.type === 'key') {
+          await page.keyboard.press(action.key);
+        } else if (action.type === 'scroll') {
+          await page.mouse.wheel({ deltaY: action.deltaY });
+        } else if (action.type === 'navigate') {
+          await page.goto(action.url, { waitUntil: 'domcontentloaded' });
         }
-      });
+      } catch (err) {
+        console.error('Action error:', err);
+      }
+    });
 
-      // 検索フォームの書き換え
-      $('form').each((_, el) => {
-        const action = $(el).attr('action') || '';
-        try {
-          const absoluteAction = new URL(action, urlObj.origin).href;
-          $(el).attr('action', '/proxy');
-          $(el).prepend(`<input type="hidden" name="url" value="${absoluteAction}">`);
-        } catch (e) {}
-      });
-
-      res.set('content-type', 'text/html; charset=utf-8');
-      return res.send($.html());
-    }
-
-    // 画像・JS・CSS・API応答はそのまま配信
-    res.set('content-type', contentType);
-    res.status(response.status).send(response.data);
+    ws.on('close', async () => {
+      console.log('Client disconnected');
+      if (browser) await browser.close();
+    });
 
   } catch (err) {
-    res.status(500).send('Proxy Routing Error: ' + err.message);
+    console.error('Cloud Chrome Error:', err);
+    if (browser) await browser.close();
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
+server.listen(PORT, () => console.log(`Relay running on port ${PORT}`));
