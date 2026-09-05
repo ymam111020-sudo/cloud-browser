@@ -8,31 +8,17 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 app.get('/ping', (req, res) => res.status(200).send('pong'));
-app.get('/', (req, res) => res.status(200).send('Smart YouTube Relay Live'));
+app.get('/', (req, res) => res.status(200).send('Bandwidth Optimized Relay Live'));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const BROWSERLESS_KEY = '2VCcBcwhj8eBb5P8215938cdf24e971e5bc92351e1b9d7739';
-const BROWSERLESS_ENDPOINT = `wss://chrome.browserless.io?token=${BROWSERLESS_KEY}&stealth=true&--disable-blink-features=AutomationControlled`;
-
-function rewriteUrl(url) {
-  try {
-    const parsed = new URL(url);
-    if (parsed.hostname.includes('youtu.be')) {
-      const videoId = parsed.pathname.slice(1);
-      return `https://yewtu.be/watch?v=${videoId}`;
-    }
-    // 動画の再生ページだけInvidiousに差し替える
-    if (parsed.hostname.includes('youtube.com') && parsed.pathname.startsWith('/watch')) {
-      parsed.hostname = 'yewtu.be';
-      return parsed.toString();
-    }
-  } catch (e) {}
-  return url;
-}
+const SESSION_ID = 'user-auth-session-v1';
+const BROWSERLESS_ENDPOINT = `wss://chrome.browserless.io?token=${BROWSERLESS_KEY}&session=${SESSION_ID}&stealth=true&--disable-blink-features=AutomationControlled`;
 
 let globalBrowser = null;
+
 async function getBrowser() {
   if (globalBrowser && globalBrowser.isConnected()) {
     return globalBrowser;
@@ -44,7 +30,7 @@ async function getBrowser() {
 }
 
 wss.on('connection', async (ws) => {
-  console.log('Client connected. Launching YouTube search enabled tab...');
+  console.log('Device connected. Initializing bandwidth-optimized session...');
 
   let page = null;
   let cdp = null;
@@ -53,6 +39,7 @@ wss.on('connection', async (ws) => {
     const browser = await getBrowser();
     page = await browser.newPage();
 
+    // 転送バイト数を減らすためビューポートを最適化 (960x640)
     await page.setViewport({ width: 960, height: 640 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
     await page.setExtraHTTPHeaders({
@@ -60,10 +47,11 @@ wss.on('connection', async (ws) => {
     });
     await page.emulateTimezone('Asia/Tokyo');
 
-    // 初期ページは本家YouTubeのトップを開く
     await page.goto('https://www.youtube.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     cdp = await page.target().createCDPSession();
+    
+    // everyNthFrame: 3 で生成フレーム自体を 1/3 に間引く
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
       quality: 50,
@@ -72,11 +60,13 @@ wss.on('connection', async (ws) => {
 
     let isSending = false;
     let lastSentTime = 0;
-    const MIN_INTERVAL_MS = 100;
+    const MIN_INTERVAL_MS = 100; // 最短でも 100ms（最大 10 FPS）に制限
 
     cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
       cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+      
       const now = Date.now();
+      // インターバル制限と送信中ロックの二重チェック
       if (ws.readyState === WebSocket.OPEN && !isSending && (now - lastSentTime >= MIN_INTERVAL_MS)) {
         isSending = true;
         lastSentTime = now;
@@ -100,8 +90,7 @@ wss.on('connection', async (ws) => {
         } else if (action.type === 'scroll') {
           await page.mouse.wheel({ deltaY: action.deltaY });
         } else if (action.type === 'navigate') {
-          const targetUrl = rewriteUrl(action.url);
-          await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         }
       } catch (err) {
         console.error('Action error:', err.message);
@@ -109,6 +98,7 @@ wss.on('connection', async (ws) => {
     });
 
     ws.on('close', async () => {
+      console.log('Device disconnected. Cleaning up tab...');
       try {
         if (cdp) await cdp.detach();
         if (page && !page.isClosed()) await page.close();
@@ -130,4 +120,4 @@ wss.on('connection', async (ws) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server live on port ${PORT}`));
+server.listen(PORT, () => console.log(`Optimized server live on port ${PORT}`));
