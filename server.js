@@ -1,108 +1,133 @@
 const express = require('express');
-const axios = require('axios');
-const path = require('path');
+const http = require('http');
+const WebSocket = require('ws');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+puppeteer.use(StealthPlugin());
+
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.get('/ping', (req, res) => res.status(200).send('pong'));
+app.get('/', (req, res) => res.status(200).send('Navigation Enabled Relay Live'));
 
-// 静的ファイルの配信（browser.html, transcribe.html など）
-app.use(express.static(path.join(__dirname, 'public')));
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-// 🌟 Google検索などの相対パス（/search など）を直前のRefererから復元して中継する
-app.use((req, res, next) => {
-  if (req.path.startsWith('/proxy') || req.path.includes('.') || req.path === '/') {
-    return next();
+const BROWSERLESS_KEY = '2VCcBcwhj8eBb5P8215938cdf24e971e5bc92351e1b9d7739';
+const SESSION_ID = 'user-auth-session-v1';
+const BROWSERLESS_ENDPOINT = `wss://chrome.browserless.io?token=${BROWSERLESS_KEY}&session=${SESSION_ID}&stealth=true&--disable-blink-features=AutomationControlled`;
+
+let globalBrowser = null;
+
+async function getBrowser() {
+  if (globalBrowser && globalBrowser.isConnected()) {
+    return globalBrowser;
   }
+  globalBrowser = await puppeteer.connect({
+    browserWSEndpoint: BROWSERLESS_ENDPOINT
+  });
+  return globalBrowser;
+}
 
-  const referer = req.headers['referer'];
-  if (referer && referer.includes('/proxy?url=')) {
-    try {
-      const prevTarget = decodeURIComponent(referer.split('/proxy?url=')[1]);
-      const prevUrlObj = new URL(prevTarget);
-      const fixedTarget = new URL(req.originalUrl, prevUrlObj.origin).toString();
-      return res.redirect(`/proxy?url=${encodeURIComponent(fixedTarget)}`);
-    } catch (e) {
-      console.error('URL rewrite error:', e);
-    }
-  }
-  next();
-});
+wss.on('connection', async (ws) => {
+  console.log('Device connected. Initializing navigation-enabled session...');
 
-// 🌟 プロキシ本体処理
-app.get('/proxy', async (req, res) => {
-  let targetUrl = req.query.url;
-
-  if (!targetUrl) {
-    return res.status(400).send('Target URL required');
-  }
-
-  if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
-    targetUrl = 'https://' + targetUrl;
-  }
+  let page = null;
+  let cdp = null;
 
   try {
-    const urlObj = new URL(targetUrl);
+    const browser = await getBrowser();
+    page = await browser.newPage();
 
-    // 🌟 メモリに溜め込まずストリームで受け取る設定（巨大ファイル・ダウンロード保護）
-    const response = await axios({
-      method: 'GET',
-      url: targetUrl,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-        'Referer': urlObj.origin
-      },
-      responseType: 'stream',
-      validateStatus: () => true
+    await page.setViewport({ width: 960, height: 640 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8'
+    });
+    await page.emulateTimezone('Asia/Tokyo');
+
+    await page.goto('https://www.youtube.com', { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    cdp = await page.target().createCDPSession();
+    
+    await cdp.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality: 50,
+      everyNthFrame: 3
     });
 
-    const contentType = response.headers['content-type'] || '';
+    let isSending = false;
+    let lastSentTime = 0;
+    const MIN_INTERVAL_MS = 100;
 
-    // HTMLファイルの場合：URLの書き換えと<base>タグの注入を行う
-    if (contentType.includes('text/html')) {
-      let chunks = [];
-      response.data.on('data', chunk => chunks.push(chunk));
-      response.data.on('end', () => {
-        let html = Buffer.concat(chunks).toString('utf-8');
-
-        // 相対リンクの解決用 <base> タグを挿入
-        const baseTag = `<base href="${urlObj.origin}/">`;
-        if (html.includes('<head>')) {
-          html = html.replace('<head>', `<head>${baseTag}`);
-        } else {
-          html = baseTag + html;
-        }
-
-        // フォームやリンクの遷移先をプロキシ経由に差し替え
-        html = html.replace(/href="(http[^"]+)"/g, (match, p1) => `href="/proxy?url=${encodeURIComponent(p1)}"`);
-        html = html.replace(/src="(http[^"]+)"/g, (match, p1) => `src="/proxy?url=${encodeURIComponent(p1)}"`);
-
-        res.set('Content-Type', 'text/html; charset=utf-8');
-        res.status(response.status).send(html);
-      });
-      response.data.on('error', (err) => {
-        console.error('HTML stream error:', err);
-        res.status(500).send('Stream error');
-      });
-    } else {
-      // 🌟 画像・音声・zip・exe等のファイル：メモリに載せず直通パイプで流す
-      if (response.headers['content-disposition']) {
-        res.set('Content-Disposition', response.headers['content-disposition']);
+    cdp.on('Page.screencastFrame', async ({ data, sessionId }) => {
+      cdp.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+      
+      const now = Date.now();
+      if (ws.readyState === WebSocket.OPEN && !isSending && (now - lastSentTime >= MIN_INTERVAL_MS)) {
+        isSending = true;
+        lastSentTime = now;
+        ws.send(JSON.stringify({ type: 'frame', data }), () => {
+          isSending = false;
+        });
       }
-      res.set('Content-Type', contentType);
-      res.status(response.status);
-      response.data.pipe(res);
+    });
+
+    // ページのURLが変わったら手元のURLバーにも反映通知を送る
+    page.on('framenavigated', (frame) => {
+      if (frame === page.mainFrame() && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'url_changed', url: page.url() }));
+      }
+    });
+
+    ws.on('message', async (message) => {
+      try {
+        const action = JSON.parse(message);
+        if (!page || page.isClosed()) return;
+
+        if (action.type === 'click') {
+          await page.mouse.click(action.x, action.y);
+        } else if (action.type === 'type') {
+          await page.keyboard.type(action.text);
+        } else if (action.type === 'key') {
+          await page.keyboard.press(action.key);
+        } else if (action.type === 'scroll') {
+          await page.mouse.wheel({ deltaY: action.deltaY });
+        } else if (action.type === 'navigate') {
+          await page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        } else if (action.type === 'back') {
+          await page.goBack({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        } else if (action.type === 'forward') {
+          await page.goForward({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        } else if (action.type === 'reload') {
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+        }
+      } catch (err) {
+        console.error('Action error:', err.message);
+      }
+    });
+
+    ws.on('close', async () => {
+      console.log('Device disconnected. Cleaning up tab...');
+      try {
+        if (cdp) await cdp.detach();
+        if (page && !page.isClosed()) await page.close();
+      } catch (e) {}
+    });
+
+    ws.on('error', async () => {
+      try {
+        if (page && !page.isClosed()) await page.close();
+      } catch (e) {}
+    });
+
+  } catch (err) {
+    console.error('Session error:', err.message);
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'error', message: err.message }));
     }
-  } catch (error) {
-    console.error('Proxy Error:', error.message);
-    res.status(500).send('Proxy Connection Failed');
   }
 });
 
-// ルートアクセス時はブラウザUIを表示
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'browser.html'));
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Navigation-ready server live on port ${PORT}`));
